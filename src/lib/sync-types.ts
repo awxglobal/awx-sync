@@ -64,3 +64,4 @@ export const contextQuery = z.object({
   max_tokens: z.coerce.number().int().min(100).max(10000).default(2000),
   format: z.enum(['plain', 'markdown']).default('plain'),
 });
+

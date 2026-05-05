@@ -9,12 +9,16 @@ import {
 } from 'drizzle-orm/pg-core';
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
+// Matches the existing table in Supabase (shared with AWX Shredder).
+// We only use id + api_key_hash; the other columns are AWX Shredder's.
 
 export const organizations = pgTable('organizations', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
+  planTier: text('plan_tier', { enum: ['FREE', 'PAID'] }),
+  email: text('email'),
+  openaiApiKey: text('openai_api_key'),
   apiKeyHash: text('api_key_hash'),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
 // ── Projects ─────────────────────────────────────────────────────────────────
@@ -113,3 +117,5 @@ export type MemoryEntry = typeof memoryEntries.$inferSelect;
 export type NewMemoryEntry = typeof memoryEntries.$inferInsert;
 export type ContextSnapshot = typeof contextSnapshots.$inferSelect;
 export type NewContextSnapshot = typeof contextSnapshots.$inferInsert;
+
+

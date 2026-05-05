@@ -38,7 +38,7 @@ adminRouter.post('/orgs', zValidator('json', createOrgBody), async (c) => {
   const apiKeyHash = hashApiKey(apiKey);
   const id = newOrgId();
 
-  await db.insert(organizations).values({ id, name, apiKeyHash });
+  await db.insert(organizations).values({ id, name, apiKeyHash, planTier: 'FREE' });
 
   return c.json(
     {

@@ -387,3 +387,4 @@ syncRouter.get('/context/:projectId/raw', async (c) => {
   const { content } = await generateContextBlock(projectId, { maxTokens });
   return c.text(content);
 });
+

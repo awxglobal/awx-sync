@@ -5,3 +5,4 @@ export type AppVariables = {
 export type AppEnv = {
   Variables: AppVariables;
 };
+

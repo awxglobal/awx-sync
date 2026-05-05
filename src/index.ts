@@ -44,3 +44,4 @@ serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
   console.log(`  ▸ Health:  http://localhost:${info.port}/health`);
   console.log(`  ▸ Status:  http://localhost:${info.port}/status\n`);
 });
+

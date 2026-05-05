@@ -38,3 +38,4 @@ export const requireApiKey = createMiddleware<AppEnv>(async (c, next) => {
   c.set('orgId', org.id);
   await next();
 });
+
