@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { zValidator } from '@hono/zod-validator';
-import { and, desc, eq, gte, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, or, sql } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { db } from '../db/client.js';
 import {
@@ -11,17 +11,42 @@ import {
   syncSessions,
 } from '../db/schema.js';
 import { generateContextBlock } from '../lib/context-generator.js';
+import { analyzeExploration } from '../lib/exploration-analysis.js';
+import {
+  buildAndSaveReplay,
+  calculateAndSaveMetrics,
+  createAndSaveContextPacket,
+  createAndSaveSessionBriefing,
+  generateAndSaveWeeklyReport,
+  generateSessionBriefingForProject,
+  generateSessionImprovementSummary,
+  loadLessons,
+  loadTaskReplays,
+  loadWorkflowEvents,
+  renderTaskReplayMarkdownForTask,
+  saveWorkflowEvents,
+} from '../lib/learning-spine-store.js';
+import type { WorkflowEvent } from '../lib/learning-spine.js';
 import {
   contextQuery,
+  contextPacketBody,
   createMemoryBody,
   createProjectBody,
   ingestFileEventsBody,
+  ingestWorkflowEventsBody,
   memoryIdParam,
   memoryQueryParams,
+  memorySearchParams,
   sessionIdParam,
   startSessionBody,
+  taskReplayBody,
   updateMemoryBody,
+  weeklyReportBody,
 } from '../lib/sync-types.js';
+import {
+  workflowEventForSessionStart,
+  workflowEventsForModifiedFiles,
+} from '../lib/workflow-event-mirror.js';
 import { requireApiKey } from '../middleware/requireApiKey.js';
 import type { AppEnv } from '../types.js';
 
@@ -31,6 +56,19 @@ syncRouter.use('*', requireApiKey);
 
 function newProjectId(): string {
   return `proj_${randomBytes(8).toString('hex')}`;
+}
+
+function withProjectBrainBriefing(briefing: string | null, content: string): string {
+  if (!briefing || content.includes('## Project Brain Briefing')) return content;
+  return `${briefing}\n\n---\n\n${content}`;
+}
+
+async function requireProjectForOrg(projectId: string, orgId: string) {
+  const [proj] = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.orgId, orgId)));
+  return proj;
 }
 
 // ── Projects ─────────────────────────────────────────────────────────────────
@@ -88,16 +126,32 @@ syncRouter.post(
       .values({ projectId: project_id, tool })
       .returning();
 
-    // Return the context block inline so callers get state in one round-trip
-    let contextBlock: string | null = null;
     try {
+      await saveWorkflowEvents([
+        workflowEventForSessionStart({
+          projectId: project_id,
+          sessionId: session.id,
+          tool,
+          startedAt: session.startedAt,
+        }),
+      ]);
+    } catch {
+      // Non-fatal: session start should still work if learning-spine capture fails.
+    }
+
+    // Return a lovable in-chat briefing inline so callers can continue instantly.
+    let contextBlock: string | null = null;
+    let projectBrainBriefing: string | null = null;
+    try {
+      const briefing = await createAndSaveSessionBriefing(project_id, session.id);
       const { content } = await generateContextBlock(project_id);
-      contextBlock = content;
+      projectBrainBriefing = briefing.markdown;
+      contextBlock = `${briefing.markdown}\n\n---\n\n${content}`;
     } catch {
       // Non-fatal: session still opens even if context gen fails
     }
 
-    return c.json({ session, context_block: contextBlock }, 201);
+    return c.json({ session, context_block: contextBlock, project_brain_briefing: projectBrainBriefing }, 201);
   },
 );
 
@@ -115,20 +169,32 @@ syncRouter.post(
     if (!session) return c.json({ error: 'session_not_found', id }, 404);
     if (session.endedAt) return c.json({ error: 'session_already_ended', id }, 409);
 
-    const [{ editCount }] = await db
-      .select({ editCount: sql<number>`count(*) filter (where ${fileEvents.eventType} = 'modified')::int` })
-      .from(fileEvents)
-      .where(eq(fileEvents.sessionId, id));
-
-    const [{ readCount }] = await db
-      .select({ readCount: sql<number>`count(*) filter (where ${fileEvents.eventType} = 'read')::int` })
-      .from(fileEvents)
-      .where(eq(fileEvents.sessionId, id));
-
-    const [{ memCount }] = await db
-      .select({ memCount: sql<number>`count(*)::int` })
-      .from(memoryEntries)
-      .where(eq(memoryEntries.sessionId, id));
+    const [[{ editCount }], [{ readCount }], [{ memCount }], hotFiles] = await Promise.all([
+      db
+        .select({ editCount: sql<number>`count(*) filter (where ${fileEvents.eventType} = 'modified')::int` })
+        .from(fileEvents)
+        .where(eq(fileEvents.sessionId, id)),
+      db
+        .select({ readCount: sql<number>`count(*) filter (where ${fileEvents.eventType} = 'read')::int` })
+        .from(fileEvents)
+        .where(eq(fileEvents.sessionId, id)),
+      db
+        .select({ memCount: sql<number>`count(*)::int` })
+        .from(memoryEntries)
+        .where(eq(memoryEntries.sessionId, id)),
+      // Files edited 5+ times in this session = "heavily worked"
+      db
+        .select({
+          filePath: fileEvents.filePath,
+          edits: sql<number>`count(*) filter (where ${fileEvents.eventType} = 'modified')::int`,
+        })
+        .from(fileEvents)
+        .where(and(eq(fileEvents.sessionId, id), eq(fileEvents.eventType, 'modified')))
+        .groupBy(fileEvents.filePath)
+        .having(sql`count(*) >= 5`)
+        .orderBy(sql`count(*) desc`)
+        .limit(5),
+    ]);
 
     const summary = { filesEdited: editCount, filesRead: readCount, memoriesCreated: memCount };
 
@@ -138,7 +204,40 @@ syncRouter.post(
       .where(eq(syncSessions.id, id))
       .returning();
 
-    return c.json(updated);
+    // Auto-create a note memory for heavily-edited files (5+ edits in the session)
+    if (hotFiles.length > 0) {
+      const fileList = hotFiles.map((f) => `${f.filePath} (${f.edits} edits)`).join(', ');
+      await db.insert(memoryEntries).values({
+        projectId: session.projectId,
+        sessionId: id,
+        category: 'note',
+        title: `Heavy edits: ${hotFiles.map((f) => f.filePath.split('/').pop()).join(', ')}`,
+        body: `Files edited 5+ times in this session: ${fileList}`,
+        relatedFiles: hotFiles.map((f) => f.filePath),
+        metadata: { auto: true, source: 'session_end' },
+      });
+    }
+
+    let projectBrainImprovementSummary: string | null = null;
+    let projectBrainReplayOutcome: string | null = null;
+    try {
+      const { replay } = await buildAndSaveReplay(session.projectId, id);
+      projectBrainReplayOutcome = replay.finalOutcome;
+    } catch {
+      // Non-fatal: session end should still succeed even if replay generation fails.
+    }
+
+    try {
+      projectBrainImprovementSummary = await generateSessionImprovementSummary(session.projectId, id);
+    } catch {
+      // Non-fatal: session end should still succeed even if proof generation fails.
+    }
+
+    return c.json({
+      session: updated,
+      project_brain_improvement_summary: projectBrainImprovementSummary,
+      project_brain_replay_outcome: projectBrainReplayOutcome,
+    });
   },
 );
 
@@ -179,7 +278,7 @@ syncRouter.post(
 
     if (!proj) return c.json({ error: 'project_not_found', project_id }, 404);
 
-    const rows = events.map((e) => ({
+    const allRows = events.map((e) => ({
       projectId: project_id,
       sessionId: session_id ?? null,
       filePath: e.file_path,
@@ -189,7 +288,40 @@ syncRouter.post(
       timestamp: e.timestamp ? new Date(e.timestamp) : new Date(),
     }));
 
-    await db.insert(fileEvents).values(rows);
+    // Deduplicate: within this batch, keep the latest event per (filePath, eventType).
+    // Prevents double-counting when the watcher debounce fires multiple rapid saves.
+    const seen = new Map<string, typeof allRows[0]>();
+    for (const row of allRows) {
+      const key = `${row.filePath}:${row.eventType}`;
+      const existing = seen.get(key);
+      if (!existing || row.timestamp > existing.timestamp) seen.set(key, row);
+    }
+    const rows = [...seen.values()];
+
+    const insertedRows = rows.length > 0 ? await db.insert(fileEvents).values(rows).returning() : [];
+
+    if (insertedRows.length > 0) {
+      try {
+        const [session] = session_id
+          ? await db
+            .select({ tool: syncSessions.tool })
+            .from(syncSessions)
+            .where(eq(syncSessions.id, session_id))
+            .limit(1)
+          : [];
+
+        await saveWorkflowEvents(
+          workflowEventsForModifiedFiles({
+            projectId: project_id,
+            taskId: session_id ?? `file_activity_${project_id}`,
+            tool: session?.tool ?? 'local',
+            files: insertedRows,
+          }),
+        );
+      } catch {
+        // Non-fatal: file activity should still be ingested if learning-spine capture fails.
+      }
+    }
 
     return c.json({ ingested: rows.length });
   },
@@ -305,6 +437,143 @@ syncRouter.patch(
   },
 );
 
+// ── Memory Search ────────────────────────────────────────────────────────────
+
+syncRouter.get('/search-memory', async (c) => {
+  const orgId = c.get('orgId');
+
+  const parsed = memorySearchParams.safeParse({
+    q: c.req.query('q'),
+    project_id: c.req.query('project_id'),
+    category: c.req.query('category'),
+    file_path: c.req.query('file_path'),
+    include_archived: c.req.query('include_archived'),
+    limit: c.req.query('limit'),
+  });
+
+  if (!parsed.success) {
+    return c.json({ error: 'invalid_query', details: parsed.error.flatten() }, 400);
+  }
+
+  const { q, project_id, category, file_path, include_archived, limit } = parsed.data;
+
+  // If a specific project is requested, verify org owns it
+  if (project_id) {
+    const [proj] = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(eq(projects.id, project_id), eq(projects.orgId, orgId)));
+    if (!proj) return c.json({ error: 'project_not_found', project_id }, 404);
+  }
+
+  // Prepare search pattern — escape % and _ in the query so they're treated as literals
+  const escaped = q.replace(/%/g, '\\%').replace(/_/g, '\\_');
+  const pattern = `%${escaped}%`;
+
+  // Build conditions
+  const conditions = [
+    // Always scope to this org's projects
+    inArray(
+      memoryEntries.projectId,
+      db.select({ id: projects.id }).from(projects).where(eq(projects.orgId, orgId)),
+    ),
+    // Text match: title OR body OR related_files (cast jsonb to text)
+    sql`(
+      ${memoryEntries.title} ilike ${pattern}
+      OR ${memoryEntries.body} ilike ${pattern}
+      OR ${memoryEntries.relatedFiles}::text ilike ${pattern}
+    )`,
+  ];
+
+  if (include_archived === 'false') conditions.push(eq(memoryEntries.archived, 'false'));
+  if (category) conditions.push(eq(memoryEntries.category, category));
+  if (project_id) conditions.push(eq(memoryEntries.projectId, project_id));
+  if (file_path) {
+    conditions.push(sql`${memoryEntries.relatedFiles}::text ilike ${'%' + file_path + '%'}`);
+  }
+
+  // Relevance score: 3 = title match, 2 = file match, 1 = body-only match
+  const relevanceScore = sql<number>`
+    CASE
+      WHEN ${memoryEntries.title} ilike ${pattern} THEN 3
+      WHEN ${memoryEntries.relatedFiles}::text ilike ${pattern} THEN 2
+      ELSE 1
+    END
+  `;
+
+  // Snippet: 200 chars of body starting near the first match position
+  const snippet = sql<string>`
+    CASE
+      WHEN length(${memoryEntries.body}) <= 220 THEN ${memoryEntries.body}
+      ELSE substring(
+        ${memoryEntries.body},
+        greatest(1, position(lower(${escaped}) in lower(${memoryEntries.body})) - 60),
+        220
+      )
+    END
+  `;
+
+  // Where the match was found (for the caller to understand why a result came back)
+  const matchIn = sql<string>`
+    CASE
+      WHEN ${memoryEntries.title} ilike ${pattern}
+        AND ${memoryEntries.body} ilike ${pattern} THEN 'title+body'
+      WHEN ${memoryEntries.title} ilike ${pattern} THEN 'title'
+      WHEN ${memoryEntries.relatedFiles}::text ilike ${pattern} THEN 'file'
+      ELSE 'body'
+    END
+  `;
+
+  const rows = await db
+    .select({
+      id: memoryEntries.id,
+      projectId: memoryEntries.projectId,
+      category: memoryEntries.category,
+      title: memoryEntries.title,
+      relatedFiles: memoryEntries.relatedFiles,
+      createdAt: memoryEntries.createdAt,
+      archived: memoryEntries.archived,
+      snippet,
+      match_in: matchIn,
+      relevance: relevanceScore,
+    })
+    .from(memoryEntries)
+    .where(and(...conditions))
+    .orderBy(sql`${relevanceScore} desc`, desc(memoryEntries.createdAt))
+    .limit(limit);
+
+  return c.json({
+    query: q,
+    count: rows.length,
+    results: rows,
+  });
+});
+
+// ── File Events (project-level) ─────────────────────────────────────────────
+
+syncRouter.get('/file-events/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+  const limit = Math.min(Number(c.req.query('limit') ?? 200), 500);
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const rows = await db
+    .select({
+      id: fileEvents.id,
+      filePath: fileEvents.filePath,
+      eventType: fileEvents.eventType,
+      timestamp: fileEvents.timestamp,
+    })
+    .from(fileEvents)
+    .where(eq(fileEvents.projectId, projectId))
+    .orderBy(desc(fileEvents.timestamp))
+    .limit(limit);
+
+  return c.json({ events: rows, count: rows.length });
+});
+
 // ── Context ──────────────────────────────────────────────────────────────────
 
 syncRouter.get('/context/:projectId', async (c) => {
@@ -327,6 +596,8 @@ syncRouter.get('/context/:projectId', async (c) => {
 
   if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
 
+  const briefing = await generateSessionBriefingForProject(projectId);
+
   // Check for a fresh cached snapshot (within 60 seconds)
   const cutoff = new Date(Date.now() - 60_000);
   const [cached] = await db
@@ -342,17 +613,21 @@ syncRouter.get('/context/:projectId', async (c) => {
     .limit(1);
 
   if (cached) {
+    const content = withProjectBrainBriefing(briefing.markdown, cached.content);
     return c.json({
-      context_block: cached.content,
-      token_estimate: cached.tokenEstimate,
+      context_block: content,
+      project_brain_briefing: briefing.markdown,
+      token_estimate: Math.ceil(content.length / 4),
       generated_at: cached.generatedAt,
       cached: true,
     });
   }
 
-  const { content, tokenEstimate } = await generateContextBlock(projectId, {
+  const generated = await generateContextBlock(projectId, {
     maxTokens: parsed.data.max_tokens,
   });
+  const content = withProjectBrainBriefing(briefing.markdown, generated.content);
+  const tokenEstimate = Math.ceil(content.length / 4);
 
   const [snapshot] = await db
     .insert(contextSnapshots)
@@ -361,6 +636,7 @@ syncRouter.get('/context/:projectId', async (c) => {
 
   return c.json({
     context_block: content,
+    project_brain_briefing: briefing.markdown,
     token_estimate: tokenEstimate,
     generated_at: snapshot.generatedAt,
     cached: false,
@@ -384,7 +660,178 @@ syncRouter.get('/context/:projectId/raw', async (c) => {
 
   const maxTokens = parsed.success ? parsed.data.max_tokens : 2000;
 
-  const { content } = await generateContextBlock(projectId, { maxTokens });
-  return c.text(content);
+  const [briefing, context] = await Promise.all([
+    generateSessionBriefingForProject(projectId),
+    generateContextBlock(projectId, { maxTokens }),
+  ]);
+  return c.text(withProjectBrainBriefing(briefing.markdown, context.content));
 });
 
+// Replay + Learning Spine
+
+syncRouter.post(
+  '/brain/events',
+  zValidator('json', ingestWorkflowEventsBody),
+  async (c) => {
+    const orgId = c.get('orgId');
+    const body = c.req.valid('json');
+
+    const proj = await requireProjectForOrg(body.project_id, orgId);
+    if (!proj) return c.json({ error: 'project_not_found', project_id: body.project_id }, 404);
+
+    const events: WorkflowEvent[] = body.events.map((event) => ({
+      id: event.id,
+      repoId: body.project_id,
+      taskId: event.task_id,
+      timestamp: event.timestamp,
+      sourceTool: event.source_tool,
+      actorType: event.actor_type,
+      type: event.type,
+      summary: event.summary,
+      metadata: event.metadata,
+      relatedFiles: event.related_files,
+      evidenceRefs: event.evidence_refs,
+    }));
+
+    await saveWorkflowEvents(events);
+    return c.json({ ingested: events.length }, 201);
+  },
+);
+
+syncRouter.get('/brain/events/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+  const taskId = c.req.query('task_id') ?? undefined;
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const events = await loadWorkflowEvents(projectId, taskId);
+  return c.json({ events, count: events.length });
+});
+
+syncRouter.post(
+  '/brain/replays',
+  zValidator('json', taskReplayBody),
+  async (c) => {
+    const orgId = c.get('orgId');
+    const body = c.req.valid('json');
+
+    const proj = await requireProjectForOrg(body.project_id, orgId);
+    if (!proj) return c.json({ error: 'project_not_found', project_id: body.project_id }, 404);
+
+    const result = await buildAndSaveReplay(body.project_id, body.task_id);
+    return c.json(result, 201);
+  },
+);
+
+syncRouter.get('/brain/replays/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const replays = await loadTaskReplays(projectId);
+  return c.json({ replays, count: replays.length });
+});
+
+syncRouter.get('/brain/replays/:projectId/:taskId/markdown', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+  const taskId = c.req.param('taskId');
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  try {
+    const markdown = await renderTaskReplayMarkdownForTask(projectId, taskId);
+    return c.text(markdown);
+  } catch (err) {
+    return c.json({ error: 'replay_not_found', message: (err as Error).message }, 404);
+  }
+});
+
+syncRouter.get('/brain/lessons/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const lessons = await loadLessons(projectId);
+  return c.json({ lessons, count: lessons.length });
+});
+
+syncRouter.post(
+  '/brain/context-packets',
+  zValidator('json', contextPacketBody),
+  async (c) => {
+    const orgId = c.get('orgId');
+    const body = c.req.valid('json');
+
+    const proj = await requireProjectForOrg(body.project_id, orgId);
+    if (!proj) return c.json({ error: 'project_not_found', project_id: body.project_id }, 404);
+
+    const packet = await createAndSaveContextPacket({
+      projectId: body.project_id,
+      taskDescription: body.task_description,
+      files: body.files,
+    });
+
+    return c.json(packet, 201);
+  },
+);
+
+syncRouter.post('/brain/metrics/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const metrics = await calculateAndSaveMetrics(projectId);
+  return c.json(metrics, 201);
+});
+
+syncRouter.post(
+  '/brain/weekly-report',
+  zValidator('json', weeklyReportBody),
+  async (c) => {
+    const orgId = c.get('orgId');
+    const body = c.req.valid('json');
+
+    const proj = await requireProjectForOrg(body.project_id, orgId);
+    if (!proj) return c.json({ error: 'project_not_found', project_id: body.project_id }, 404);
+
+    const report_markdown = await generateAndSaveWeeklyReport(
+      body.project_id,
+      new Date(body.week_start),
+      new Date(body.week_end),
+    );
+
+    return c.json({ report_markdown }, 201);
+  },
+);
+
+// ── Exploration Analysis ────────────────────────────────────────────────────
+
+syncRouter.post('/brain/exploration/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const body = await c.req.json() as {
+    task_id: string;
+    task_description?: string;
+  };
+
+  if (!body.task_id) {
+    return c.json({ error: 'task_id_required' }, 400);
+  }
+
+  const analysis = await analyzeExploration(projectId, body.task_id, body.task_description);
+  return c.json(analysis);
+});

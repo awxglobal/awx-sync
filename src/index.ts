@@ -3,11 +3,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
+import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { db } from './db/client.js';
 import { organizations } from './db/schema.js';
 import { renderProjectBrainOnboardingPage } from './lib/saas-onboarding.js';
 import { adminRouter } from './routes/admin.js';
+import { authRouter } from './routes/auth.js';
 import { githubRouter, writeBackRouter } from './routes/github-webhooks.js';
 import { syncRouter } from './routes/sync.js';
 import type { AppEnv } from './types.js';
@@ -15,6 +17,18 @@ import type { AppEnv } from './types.js';
 const app = new Hono<AppEnv>();
 
 app.use('*', logger());
+const dashboardCors = cors({
+  origin: (origin) => {
+    if (origin === 'https://project-brain-dashboard.fly.dev') return origin;
+    if (origin === 'http://localhost:4000') return origin;
+    return null;
+  },
+  credentials: true,
+  allowHeaders: ['Authorization', 'Content-Type'],
+  allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+});
+app.use('/auth/*', dashboardCors);
+app.use('/sync/*', dashboardCors);
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
@@ -70,6 +84,9 @@ app.post('/auth/reveal-key', (c) => {
   }
   return c.json({ apiKey: awx.apiKey });
 });
+
+// Dashboard auth: GitHub OAuth + JWT verification
+app.route('/auth', authRouter);
 
 // GitHub webhooks (no API key — verified by HMAC signature)
 app.route('/', githubRouter);
