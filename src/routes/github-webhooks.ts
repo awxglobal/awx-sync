@@ -414,38 +414,71 @@ async function findProjectByRepo(repoFullName: string): Promise<{ id: string } |
   const orgName = repoFullName.split('/')[0] ?? '';
   const allProjects = await db.select({ id: projects.id, name: projects.name, rootPath: projects.rootPath, orgId: projects.orgId }).from(projects);
 
+  console.log(`[webhook:match] Looking for ${repoFullName} (repo=${repoName}, org=${orgName}), ${allProjects.length} projects in DB`);
+  for (const p of allProjects) {
+    console.log(`[webhook:match]   project=${p.id} name=${p.name} rootPath=${p.rootPath} orgId=${p.orgId}`);
+  }
+
+  // 0. Exact rootPath match for full repo name (e.g., "awxglobal/awx-sync")
+  const fullPathMatch = allProjects.find(
+    (p) => p.rootPath.toLowerCase() === repoFullName.toLowerCase(),
+  );
+  if (fullPathMatch) {
+    console.log(`[webhook:match] ✅ Exact full-path match: ${fullPathMatch.id}`);
+    return { id: fullPathMatch.id };
+  }
+
   // 1. Exact name match
   const exact = allProjects.find(
     (p) => p.name.toLowerCase() === repoName.toLowerCase(),
   );
-  if (exact) return { id: exact.id };
+  if (exact) {
+    console.log(`[webhook:match] ✅ Exact name match: ${exact.id}`);
+    return { id: exact.id };
+  }
 
   // 2. rootPath contains repo name
   const pathMatch = allProjects.find(
     (p) => p.rootPath.toLowerCase().includes(repoName.toLowerCase()),
   );
-  if (pathMatch) return { id: pathMatch.id };
+  if (pathMatch) {
+    console.log(`[webhook:match] ✅ Path match: ${pathMatch.id}`);
+    return { id: pathMatch.id };
+  }
 
-  // 3. Match by GitHub org — find org with matching github login, use their first project
+  // 3. Match by GitHub org — find org with matching github login
+  //    Then find the LARGEST project (most memories) in that org or any linked org
   const orgs = await db.select({ id: organizations.id, email: organizations.email }).from(organizations);
   const matchedOrg = orgs.find(
     (o) => o.email?.toLowerCase() === `github:${orgName.toLowerCase()}`,
   );
   if (matchedOrg) {
-    const orgProject = allProjects.find((p) => p.orgId === matchedOrg.id);
-    if (orgProject) {
-      console.log(`[webhook] Matched repo ${repoFullName} to project ${orgProject.id} via org ${matchedOrg.id}`);
-      return { id: orgProject.id };
+    // First check if the GitHub org itself has projects
+    const orgProjects = allProjects.filter((p) => p.orgId === matchedOrg.id);
+    if (orgProjects.length > 0) {
+      console.log(`[webhook:match] ✅ GitHub org match: ${orgProjects[0].id} via org ${matchedOrg.id}`);
+      return { id: orgProjects[0].id };
     }
+    // If not, check if another org has projects that could belong to the same user
+    // (user created project via CLI under one org, then logged in via GitHub creating another org)
+    console.log(`[webhook:match] GitHub org ${matchedOrg.id} has no projects, checking other orgs`);
   }
 
-  // 4. Fallback — if there's only one project total, use it (single-user setup)
+  // 4. Fallback — pick the first project that's NOT a throwaway name
+  //    (single-user or multi-project setup where name/path don't match)
+  const nonTrivial = allProjects.filter((p) => p.name !== 'hi' && p.name !== 'test');
+  if (nonTrivial.length === 1) {
+    console.log(`[webhook:match] ✅ Single non-trivial project fallback: ${nonTrivial[0].id}`);
+    return { id: nonTrivial[0].id };
+  }
+
+  // 5. Last resort — if only one project total
   if (allProjects.length === 1) {
-    console.log(`[webhook] Single project fallback: ${allProjects[0].id} for repo ${repoFullName}`);
+    console.log(`[webhook:match] ✅ Single project fallback: ${allProjects[0].id}`);
     return { id: allProjects[0].id };
   }
 
-  console.log(`[webhook] No project match for repo ${repoFullName}`);
+  console.log(`[webhook:match] ❌ No project match for ${repoFullName}`);
   return null;
 }
 
