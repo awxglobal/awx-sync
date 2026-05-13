@@ -7,11 +7,13 @@ import {
   contextSnapshots,
   fileEvents,
   memoryEntries,
+  operationalLessons,
   projects,
   syncSessions,
 } from '../db/schema.js';
 import { generateContextBlock } from '../lib/context-generator.js';
 import { analyzeExploration } from '../lib/exploration-analysis.js';
+import { generateLessonsFromData } from '../lib/lesson-generator.js';
 import {
   buildAndSaveReplay,
   calculateAndSaveMetrics,
@@ -759,8 +761,18 @@ syncRouter.get('/brain/lessons/:projectId', async (c) => {
   const proj = await requireProjectForOrg(projectId, orgId);
   if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
 
-  const lessons = await loadLessons(projectId);
-  return c.json({ lessons, count: lessons.length });
+  // Auto-generate lessons from real data if ?generate=true or no lessons exist
+  const existing = await loadLessons(projectId);
+  const shouldGenerate = c.req.query('generate') === 'true' || existing.length === 0;
+
+  if (shouldGenerate) {
+    const generated = await generateLessonsFromData(projectId);
+    // Reload all lessons (generated + any previously saved)
+    const all = await loadLessons(projectId);
+    return c.json({ lessons: all, count: all.length, generated: generated.length });
+  }
+
+  return c.json({ lessons: existing, count: existing.length, generated: 0 });
 });
 
 syncRouter.post(
@@ -834,4 +846,104 @@ syncRouter.post('/brain/exploration/:projectId', async (c) => {
 
   const analysis = await analyzeExploration(projectId, body.task_id, body.task_description);
   return c.json(analysis);
+});
+
+// ── Health / Cockpit ────────────────────────────────────────────────────────
+
+syncRouter.get('/health/:projectId', async (c) => {
+  const orgId = c.get('orgId');
+  const projectId = c.req.param('projectId');
+
+  const proj = await requireProjectForOrg(projectId, orgId);
+  if (!proj) return c.json({ error: 'project_not_found', project_id: projectId }, 404);
+
+  const now = new Date();
+  const twentyFourHours = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const oneHour = new Date(now.getTime() - 60 * 60 * 1000);
+
+  // Gather signals from real data
+  const [recentFiles, recentMemories, lessons] = await Promise.all([
+    db
+      .select({ filePath: fileEvents.filePath, eventType: fileEvents.eventType, timestamp: fileEvents.timestamp })
+      .from(fileEvents)
+      .where(and(eq(fileEvents.projectId, projectId), gte(fileEvents.timestamp, twentyFourHours)))
+      .orderBy(desc(fileEvents.timestamp))
+      .limit(500),
+    db
+      .select({ id: memoryEntries.id, category: memoryEntries.category, createdAt: memoryEntries.createdAt })
+      .from(memoryEntries)
+      .where(and(eq(memoryEntries.projectId, projectId), gte(memoryEntries.createdAt, twentyFourHours)))
+      .orderBy(desc(memoryEntries.createdAt)),
+    db
+      .select({ id: operationalLessons.id, area: operationalLessons.area, confidence: operationalLessons.confidence })
+      .from(operationalLessons)
+      .where(eq(operationalLessons.projectId, projectId)),
+  ]);
+
+  // Compute cockpit signals
+  const uniqueFiles = new Set(recentFiles.map((f) => f.filePath));
+  const recentHourFiles = recentFiles.filter((f) => f.timestamp >= oneHour);
+  const uniqueRecentFiles = new Set(recentHourFiles.map((f) => f.filePath));
+
+  // Scope: how many files touched in 24h
+  const scopeCount = uniqueFiles.size;
+  const scopeStatus = scopeCount <= 5 ? 'green' : scopeCount <= 15 ? 'amber' : 'red';
+  const scopeDetail = `${scopeCount} files changed in the last 24 hours`;
+
+  // Focus: how many distinct directories (modules)
+  const dirs = new Set(Array.from(uniqueFiles).map((f) => f.split('/').slice(0, -1).join('/')).filter(Boolean));
+  const focusStatus = dirs.size <= 2 ? 'green' : dirs.size <= 4 ? 'amber' : 'red';
+  const focusDetail = `changes span ${dirs.size} directories`;
+
+  // Repetition: any file edited more than 3 times in the last hour
+  const hourFileCounts = new Map<string, number>();
+  for (const f of recentHourFiles) {
+    hourFileCounts.set(f.filePath, (hourFileCounts.get(f.filePath) ?? 0) + 1);
+  }
+  const maxRepeat = Math.max(0, ...hourFileCounts.values());
+  const repetitionStatus = maxRepeat <= 2 ? 'green' : maxRepeat <= 4 ? 'amber' : 'red';
+  const repetitionDetail = maxRepeat <= 2
+    ? 'no file edited more than twice in the last hour'
+    : `a file was edited ${maxRepeat} times in the last hour`;
+
+  // Duration: total activity window
+  const timestamps = recentFiles.map((f) => f.timestamp.getTime());
+  const activitySpanHours = timestamps.length > 1
+    ? (Math.max(...timestamps) - Math.min(...timestamps)) / (1000 * 60 * 60)
+    : 0;
+  const durationStatus = activitySpanHours <= 4 ? 'green' : activitySpanHours <= 12 ? 'amber' : 'red';
+  const durationDetail = `${Math.round(activitySpanHours)}h activity window in the last 24h`;
+
+  // Trajectory: lessons and bug patterns
+  const bugMemories = recentMemories.filter((m) => m.category === 'bug_fix');
+  const highConfLessons = lessons.filter((l) => (l.confidence ?? 0) >= 0.7);
+  const trajectoryStatus = bugMemories.length === 0 && highConfLessons.length <= 2
+    ? 'green'
+    : bugMemories.length <= 2 && highConfLessons.length <= 5
+      ? 'amber'
+      : 'red';
+  const trajectoryDetail = `${lessons.length} lessons (${highConfLessons.length} high confidence), ${bugMemories.length} recent bugs`;
+
+  // Overall status
+  const statuses = [scopeStatus, focusStatus, repetitionStatus, durationStatus, trajectoryStatus];
+  const overallStatus = statuses.includes('red') ? 'red' : statuses.includes('amber') ? 'amber' : 'green';
+
+  const summaryText = overallStatus === 'green'
+    ? `Healthy — ${scopeCount} files, ${recentMemories.length} events, all signals green.`
+    : overallStatus === 'amber'
+      ? `Running warm — ${scopeCount} files across ${dirs.size} modules in 24h.`
+      : `Running hot — ${scopeCount} files across ${dirs.size} modules, ${maxRepeat}x repetition detected.`;
+
+  return c.json({
+    status: overallStatus,
+    summary: summaryText,
+    signals: {
+      scope: { status: scopeStatus, detail: scopeDetail },
+      focus: { status: focusStatus, detail: focusDetail },
+      repetition: { status: repetitionStatus, detail: repetitionDetail },
+      duration: { status: durationStatus, detail: durationDetail },
+      trajectory: { status: trajectoryStatus, detail: trajectoryDetail },
+    },
+    source: 'api',
+  });
 });
