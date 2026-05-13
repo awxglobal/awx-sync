@@ -42,6 +42,8 @@ githubRouter.post('/webhooks/github', async (c) => {
 
   const payload = JSON.parse(rawBody) as Record<string, unknown>;
   const action = payload.action as string | undefined;
+  const repo = (payload.repository as Record<string, unknown>)?.full_name ?? 'unknown';
+  console.log(`[webhook] Received event=${event} action=${action} repo=${repo}`);
 
   try {
     switch (event) {
@@ -64,12 +66,13 @@ githubRouter.post('/webhooks/github', async (c) => {
         await handlePullRequestReview(payload, action);
         break;
       case 'installation':
-        // GitHub App installed/uninstalled — handled via callback URL
+        console.log(`[webhook] Installation event: ${action}`);
         break;
       default:
-        // Unsupported event type — ignore silently
+        console.log(`[webhook] Ignoring unsupported event: ${event}`);
         break;
     }
+    console.log(`[webhook] Handled ${event}.${action} for ${repo} — OK`);
   } catch (err) {
     console.error(`[webhook] Error handling ${event}.${action}:`, err);
     // Return 200 anyway so GitHub doesn't retry
@@ -86,8 +89,13 @@ async function handlePullRequest(payload: Record<string, unknown>, action?: stri
   const repoFullName = repo.full_name as string;
   const installationId = (payload.installation as Record<string, unknown>)?.id as number | undefined;
 
+  console.log(`[webhook:pr] ${action} on ${repoFullName}`);
   const project = await findProjectByRepo(repoFullName);
-  if (!project) return;
+  if (!project) {
+    console.log(`[webhook:pr] No project found for ${repoFullName} — skipping`);
+    return;
+  }
+  console.log(`[webhook:pr] Matched project ${project.id}`);
 
   if (action === 'opened' || action === 'reopened') {
     const title = pr.title as string;
@@ -150,8 +158,13 @@ async function handlePullRequest(payload: Record<string, unknown>, action?: stri
 async function handlePush(payload: Record<string, unknown>) {
   const repo = payload.repository as Record<string, unknown>;
   const repoFullName = repo.full_name as string;
+  console.log(`[webhook:push] Looking up project for ${repoFullName}`);
   const project = await findProjectByRepo(repoFullName);
-  if (!project) return;
+  if (!project) {
+    console.log(`[webhook:push] No project found for ${repoFullName} — skipping`);
+    return;
+  }
+  console.log(`[webhook:push] Matched project ${project.id}`);
 
   const commits = (payload.commits as Array<Record<string, unknown>>) ?? [];
 
@@ -176,6 +189,8 @@ async function handlePush(payload: Record<string, unknown>) {
     }
   }
 
+  console.log(`[webhook:push] Collected ${fileEventRows.length} file events from ${commits.length} commits`);
+
   if (fileEventRows.length > 0) {
     // Deduplicate — keep latest per (filePath, eventType)
     const seen = new Map<string, (typeof fileEventRows)[0]>();
@@ -184,12 +199,17 @@ async function handlePush(payload: Record<string, unknown>) {
       const existing = seen.get(key);
       if (!existing || row.timestamp > existing.timestamp) seen.set(key, row);
     }
-    await db.insert(fileEvents).values([...seen.values()].map((r) => ({
+    const deduped = [...seen.values()];
+    console.log(`[webhook:push] Inserting ${deduped.length} deduplicated file events`);
+    await db.insert(fileEvents).values(deduped.map((r) => ({
       ...r,
       sessionId: null,
       diff: null,
       fileSize: null,
     })));
+    console.log(`[webhook:push] ✅ Inserted ${deduped.length} file events for ${repoFullName}`);
+  } else {
+    console.log(`[webhook:push] No file events to insert`);
   }
 }
 
