@@ -105,6 +105,91 @@ export const contextSnapshots = pgTable('context_snapshots', {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+// Replay + Learning Spine
+
+export const workflowEvents = pgTable('workflow_events', {
+  id: text('id').primaryKey(),
+  projectId: text('project_id')
+    .notNull()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  taskId: text('task_id').notNull(),
+  timestamp: timestamp('timestamp', { withTimezone: true }).notNull(),
+  sourceTool: text('source_tool').notNull(),
+  actorType: text('actor_type').notNull(),
+  type: text('type').notNull(),
+  summary: text('summary').notNull(),
+  metadata: jsonb('metadata').$type<Record<string, unknown>>().notNull().default({}),
+  relatedFiles: jsonb('related_files').$type<string[]>().notNull().default([]),
+  evidenceRefs: jsonb('evidence_refs').$type<Array<Record<string, unknown>>>().notNull().default([]),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const taskReplays = pgTable('task_replays', {
+  id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+  projectId: text('project_id')
+    .notNull()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  taskId: text('task_id').notNull(),
+  startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+  endedAt: timestamp('ended_at', { withTimezone: true }),
+  finalOutcome: text('final_outcome').notNull(),
+  replay: jsonb('replay').$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const operationalLessons = pgTable('operational_lessons', {
+  id: text('id').primaryKey(),
+  projectId: text('project_id')
+    .notNull()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  scope: text('scope').notNull(),
+  area: text('area').notNull(),
+  trigger: text('trigger').notNull(),
+  lesson: text('lesson').notNull(),
+  evidenceRefs: jsonb('evidence_refs').$type<string[]>().notNull().default([]),
+  appliesToFiles: jsonb('applies_to_files').$type<string[]>().notNull().default([]),
+  requiredTests: jsonb('required_tests').$type<string[]>().notNull().default([]),
+  reviewerExpectations: jsonb('reviewer_expectations').$type<string[]>().notNull().default([]),
+  confidence: doublePrecision('confidence').notNull(),
+  status: text('status').notNull().default('proposed'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const contextPackets = pgTable('context_packets', {
+  id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+  projectId: text('project_id')
+    .notNull()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  taskDescription: text('task_description').notNull(),
+  files: jsonb('files').$type<string[]>().notNull().default([]),
+  packet: jsonb('packet').$type<Record<string, unknown>>().notNull(),
+  briefingMarkdown: text('briefing_markdown').notNull(),
+  generatedAt: timestamp('generated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const metricsSnapshots = pgTable('metrics_snapshots', {
+  id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+  projectId: text('project_id')
+    .notNull()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  metrics: jsonb('metrics').$type<Record<string, unknown>>().notNull(),
+  generatedAt: timestamp('generated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const weeklyReports = pgTable('weekly_reports', {
+  id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+  projectId: text('project_id')
+    .notNull()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  weekStart: timestamp('week_start', { withTimezone: true }).notNull(),
+  weekEnd: timestamp('week_end', { withTimezone: true }).notNull(),
+  metrics: jsonb('metrics').$type<Record<string, unknown>>().notNull(),
+  reportMarkdown: text('report_markdown').notNull(),
+  generatedAt: timestamp('generated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type Organization = typeof organizations.$inferSelect;
 export type NewOrganization = typeof organizations.$inferInsert;
 export type Project = typeof projects.$inferSelect;
@@ -117,5 +202,16 @@ export type MemoryEntry = typeof memoryEntries.$inferSelect;
 export type NewMemoryEntry = typeof memoryEntries.$inferInsert;
 export type ContextSnapshot = typeof contextSnapshots.$inferSelect;
 export type NewContextSnapshot = typeof contextSnapshots.$inferInsert;
-
+export type WorkflowEventRow = typeof workflowEvents.$inferSelect;
+export type NewWorkflowEventRow = typeof workflowEvents.$inferInsert;
+export type TaskReplayRow = typeof taskReplays.$inferSelect;
+export type NewTaskReplayRow = typeof taskReplays.$inferInsert;
+export type OperationalLessonRow = typeof operationalLessons.$inferSelect;
+export type NewOperationalLessonRow = typeof operationalLessons.$inferInsert;
+export type ContextPacketRow = typeof contextPackets.$inferSelect;
+export type NewContextPacketRow = typeof contextPackets.$inferInsert;
+export type MetricsSnapshotRow = typeof metricsSnapshots.$inferSelect;
+export type NewMetricsSnapshotRow = typeof metricsSnapshots.$inferInsert;
+export type WeeklyReportRow = typeof weeklyReports.$inferSelect;
+export type NewWeeklyReportRow = typeof weeklyReports.$inferInsert;
 
