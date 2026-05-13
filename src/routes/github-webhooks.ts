@@ -390,17 +390,42 @@ async function buildIssueContextComment(
 // ── Repo → Project Lookup ───────────────────────────────────────────────────
 
 async function findProjectByRepo(repoFullName: string): Promise<{ id: string } | null> {
-  // Match by project name or root_path containing the repo name
   const repoName = repoFullName.split('/').pop() ?? repoFullName;
-  const allProjects = await db.select({ id: projects.id, name: projects.name, rootPath: projects.rootPath }).from(projects);
+  const orgName = repoFullName.split('/')[0] ?? '';
+  const allProjects = await db.select({ id: projects.id, name: projects.name, rootPath: projects.rootPath, orgId: projects.orgId }).from(projects);
 
-  // Try exact name match first
+  // 1. Exact name match
   const exact = allProjects.find(
-    (p) => p.name.toLowerCase() === repoName.toLowerCase() || p.rootPath.toLowerCase().includes(repoName.toLowerCase()),
+    (p) => p.name.toLowerCase() === repoName.toLowerCase(),
   );
   if (exact) return { id: exact.id };
 
-  // No match — webhook from a repo we don't track
+  // 2. rootPath contains repo name
+  const pathMatch = allProjects.find(
+    (p) => p.rootPath.toLowerCase().includes(repoName.toLowerCase()),
+  );
+  if (pathMatch) return { id: pathMatch.id };
+
+  // 3. Match by GitHub org — find org with matching github login, use their first project
+  const orgs = await db.select({ id: organizations.id, email: organizations.email }).from(organizations);
+  const matchedOrg = orgs.find(
+    (o) => o.email?.toLowerCase() === `github:${orgName.toLowerCase()}`,
+  );
+  if (matchedOrg) {
+    const orgProject = allProjects.find((p) => p.orgId === matchedOrg.id);
+    if (orgProject) {
+      console.log(`[webhook] Matched repo ${repoFullName} to project ${orgProject.id} via org ${matchedOrg.id}`);
+      return { id: orgProject.id };
+    }
+  }
+
+  // 4. Fallback — if there's only one project total, use it (single-user setup)
+  if (allProjects.length === 1) {
+    console.log(`[webhook] Single project fallback: ${allProjects[0].id} for repo ${repoFullName}`);
+    return { id: allProjects[0].id };
+  }
+
+  console.log(`[webhook] No project match for repo ${repoFullName}`);
   return null;
 }
 
