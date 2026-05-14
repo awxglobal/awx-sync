@@ -21,6 +21,7 @@ const dashboardCors = cors({
   origin: (origin) => {
     if (origin === 'https://project-brain-dashboard.fly.dev') return origin;
     if (origin === 'http://localhost:4000') return origin;
+    if (origin?.endsWith('.lovable.app')) return origin;
     return null;
   },
   credentials: true,
