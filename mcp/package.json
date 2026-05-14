@@ -1,0 +1,40 @@
+{
+  "name": "awx-sync-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for awx-sync — gives Claude Code persistent project memory across sessions",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "awx-sync-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "claude-code",
+    "memory",
+    "project-memory",
+    "ai-tools"
+  ],
+  "license": "MIT"
+}
